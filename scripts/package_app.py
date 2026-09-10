@@ -1012,7 +1012,7 @@ def main():
             build_narrafork_app(x64_bin, create_dmg_installer=not args.no_dmg, install_to_applications=False, update_desktop_shortcut=False, reveal_in_finder=False)
             return
         elif target_bin:
-            build_narrafork_app(target_bin, create_dmg_installer=not args.no_dmg, reveal_in_finder=False)
+            build_narrafork_app(target_bin, create_dmg_installer=not args.no_dmg, install_to_applications=not args.no_install, reveal_in_finder=False)
             return
         else:
             candidates = []
