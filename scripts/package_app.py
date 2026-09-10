@@ -404,6 +404,17 @@ def build_narrafork_app(
         deployed_app = APPLICATIONS_APP
         log_fn(f"✅ 系统应用程序已同步更新！")
 
+        # 自动同步归档一份到用户版本库 ~/.narrafork/versions/
+        try:
+            versions_dir = os.path.expanduser("~/.narrafork/versions")
+            os.makedirs(versions_dir, exist_ok=True)
+            archived_bin = os.path.join(versions_dir, f"narrafork-{ver}-macos-arm64")
+            if not os.path.isfile(archived_bin):
+                shutil.copy2(target_backend, archived_bin)
+                os.chmod(archived_bin, 0o755)
+        except Exception:
+            pass
+
     # 9. 更新桌面快捷方式
     if update_desktop_shortcut:
         desktop_link = os.path.join(DESKTOP_DIR, "NarraFork.app")
