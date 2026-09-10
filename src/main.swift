@@ -8,8 +8,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     var weStartedBackend: Bool = false
     var checkTimer: Timer?
     var retryCount: Int = 0
-    let targetPort: Int = 7788
+    var targetHost: String = "0.0.0.0"
+    var targetPort: Int = 7788
     var statusItem: NSStatusItem?
+    var browserMenuItem: NSMenuItem?
+    var configMenuItem: NSMenuItem?
     var versionMenuItem: NSMenuItem?
     var versionSubmenu: NSMenu?
     var currentActiveVersion: String = "0.7.2"
@@ -17,7 +20,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     var activityToken: NSObjectProtocol?
 
     var targetURL: URL {
-        return URL(string: "http://127.0.0.1:\(targetPort)")!
+        let connectHost = (targetHost == "0.0.0.0" || targetHost.isEmpty) ? "127.0.0.1" : targetHost
+        return URL(string: "http://\(connectHost):\(targetPort)")!
     }
 
     func applicationDidFinishLaunching(_ aNotification: Notification) {
@@ -28,6 +32,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
             reason: "NarraFork High Performance Rendering & Background Core"
         )
 
+        loadLauncherConfig()
         setupMenu()
         setupStatusItem()
         setupWindow()
@@ -58,15 +63,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
 
         menu.addItem(NSMenuItem.separator())
 
-        let browserItem = NSMenuItem(title: "在浏览器中打开 (localhost:\(targetPort))", action: #selector(openInBrowser), keyEquivalent: "")
+        let displayHost = (targetHost == "0.0.0.0" || targetHost == "127.0.0.1") ? "localhost" : targetHost
+        let browserItem = NSMenuItem(title: "在浏览器中打开 (\(displayHost):\(targetPort))", action: #selector(openInBrowser), keyEquivalent: "")
         browserItem.target = self
         menu.addItem(browserItem)
+        self.browserMenuItem = browserItem
 
         menu.addItem(NSMenuItem.separator())
 
         let restartItem = NSMenuItem(title: "重启核心服务", action: #selector(restartCoreBackend), keyEquivalent: "")
         restartItem.target = self
         menu.addItem(restartItem)
+
+        let cfgItem = NSMenuItem(title: "启动设置 (\(targetHost):\(targetPort))...", action: #selector(openNetworkSettingsDialog), keyEquivalent: "")
+        cfgItem.target = self
+        menu.addItem(cfgItem)
+        self.configMenuItem = cfgItem
 
         // 核心版本管理与回退
         let verItem = NSMenuItem(title: "核心版本回退与切换", action: nil, keyEquivalent: "")
@@ -139,6 +151,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     }
 
     @objc func restartCoreBackend() {
+        restartCoreBackend(extraPortToKill: nil)
+    }
+
+    func restartCoreBackend(extraPortToKill: Int? = nil) {
         checkTimer?.invalidate()
         if let proc = backendProcess {
             proc.terminationHandler = nil
@@ -155,6 +171,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         }
         backendProcess = nil
         killAnyProcessOnPort(port: targetPort)
+        if let extraPort = extraPortToKill, extraPort != targetPort {
+            killAnyProcessOnPort(port: extraPort)
+        }
         checkAndApplyPlacedUpdate()
         resolveActiveCoreVersion()
         clearWebViewCache { [weak self] in
@@ -162,6 +181,139 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
             self.loadSplashScreen(status: "正在重启核心服务...")
             self.launchBackendProcess()
         }
+    }
+
+    // MARK: - Launch Configuration (启动设置: 绑定 IP 与端口)
+
+    func loadLauncherConfig() {
+        let homeDir = FileManager.default.homeDirectoryForCurrentUser
+        let configURL = homeDir.appendingPathComponent(".narrafork/launcher_config.json")
+        if let data = try? Data(contentsOf: configURL),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let h = json["host"] as? String, !h.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                targetHost = h.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            if let p = json["port"] as? Int, (1...65535).contains(p) {
+                targetPort = p
+            } else if let pStr = json["port"] as? String, let p = Int(pStr), (1...65535).contains(p) {
+                targetPort = p
+            }
+        }
+    }
+
+    func saveLauncherConfig(host: String, port: Int) {
+        let homeDir = FileManager.default.homeDirectoryForCurrentUser
+        let configDir = homeDir.appendingPathComponent(".narrafork")
+        try? FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
+        let configURL = configDir.appendingPathComponent("launcher_config.json")
+        let dict: [String: Any] = [
+            "host": host,
+            "port": port,
+            "updatedAt": ISO8601DateFormatter().string(from: Date())
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted]) {
+            try? data.write(to: configURL)
+        }
+        targetHost = host
+        targetPort = port
+        updateMenuItems()
+    }
+
+    func updateMenuItems() {
+        let displayHost = (targetHost == "0.0.0.0" || targetHost == "127.0.0.1") ? "localhost" : targetHost
+        browserMenuItem?.title = "在浏览器中打开 (\(displayHost):\(targetPort))"
+        configMenuItem?.title = "启动设置 (\(targetHost):\(targetPort))..."
+    }
+
+    @objc func openNetworkSettingsDialog() {
+        let alert = NSAlert()
+        alert.messageText = "NarraFork 核心启动设置"
+        alert.informativeText = "您可以自定义配置后端核心服务的网络监听 IP 地址与服务端口号。\n修改保存后，启动器将自动保存并以指定参数平滑重启核心服务生效。"
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "保存并重启核心")
+        alert.addButton(withTitle: "取消")
+        alert.addButton(withTitle: "恢复默认 (0.0.0.0 : 7788)")
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: 175))
+
+        // 1. IP / Host
+        let hostLabel = NSTextField(labelWithString: "绑定 IP (Host):")
+        hostLabel.frame = NSRect(x: 0, y: 152, width: 380, height: 18)
+        hostLabel.font = NSFont.systemFont(ofSize: 12, weight: .bold)
+        container.addSubview(hostLabel)
+
+        let hostField = NSTextField(frame: NSRect(x: 0, y: 124, width: 380, height: 24))
+        hostField.stringValue = targetHost
+        hostField.placeholderString = "例如 0.0.0.0 或 127.0.0.1"
+        container.addSubview(hostField)
+
+        let hostHint = NSTextField(labelWithString: "• 0.0.0.0：允许同一 Wi-Fi 下的 iPhone / iPad 局域网无缝访问\n• 127.0.0.1：仅允许当前 Mac 本机访问")
+        hostHint.frame = NSRect(x: 0, y: 88, width: 380, height: 32)
+        hostHint.font = NSFont.systemFont(ofSize: 11)
+        hostHint.textColor = .secondaryLabelColor
+        container.addSubview(hostHint)
+
+        // 2. Port
+        let portLabel = NSTextField(labelWithString: "端口号 (Port):")
+        portLabel.frame = NSRect(x: 0, y: 62, width: 380, height: 18)
+        portLabel.font = NSFont.systemFont(ofSize: 12, weight: .bold)
+        container.addSubview(portLabel)
+
+        let portField = NSTextField(frame: NSRect(x: 0, y: 34, width: 380, height: 24))
+        portField.stringValue = "\(targetPort)"
+        portField.placeholderString = "例如 7788"
+        container.addSubview(portField)
+
+        let portHint = NSTextField(labelWithString: "建议端口范围 1024 - 65535（系统默认端口为 7788）")
+        portHint.frame = NSRect(x: 0, y: 10, width: 380, height: 18)
+        portHint.font = NSFont.systemFont(ofSize: 11)
+        portHint.textColor = .secondaryLabelColor
+        container.addSubview(portHint)
+
+        alert.accessoryView = container
+        NSApp.activate(ignoringOtherApps: true)
+
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            let newHost = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            let newPortStr = portField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            guard !newHost.isEmpty else {
+                showConfigError("IP 地址不能为空，推荐填写 0.0.0.0 或 127.0.0.1")
+                return
+            }
+
+            guard let newPort = Int(newPortStr), (1...65535).contains(newPort) else {
+                showConfigError("端口号必须为 1 到 65535 之间的有效数字（例如 7788）")
+                return
+            }
+
+            let oldPort = self.targetPort
+            self.saveLauncherConfig(host: newHost, port: newPort)
+            NSLog("NarraFork: 用户设置启动网络配置为 %@:%d", newHost, newPort)
+
+            self.loadSplashScreen(status: "已应用启动设置，正在以 \(newHost):\(newPort) 重启核心...")
+            self.restartCoreBackend(extraPortToKill: oldPort)
+
+        } else if response == .alertThirdButtonReturn {
+            let oldPort = self.targetPort
+            self.saveLauncherConfig(host: "0.0.0.0", port: 7788)
+            NSLog("NarraFork: 用户恢复默认启动网络配置 0.0.0.0:7788")
+
+            self.loadSplashScreen(status: "已恢复默认设置，正在以 0.0.0.0:7788 重启核心...")
+            self.restartCoreBackend(extraPortToKill: oldPort)
+        }
+    }
+
+    func showConfigError(_ msg: String) {
+        let errAlert = NSAlert()
+        errAlert.messageText = "网络启动设置无效"
+        errAlert.informativeText = msg
+        errAlert.alertStyle = .warning
+        errAlert.addButton(withTitle: "重新配置")
+        NSApp.activate(ignoringOtherApps: true)
+        errAlert.runModal()
+        openNetworkSettingsDialog()
     }
 
     // MARK: - Architecture & Multi-Version Management (双芯片架构与多版本管理)
@@ -649,6 +801,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         let appName = "NarraFork"
         appMenu.addItem(withTitle: "关于 \(appName)", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
         appMenu.addItem(NSMenuItem.separator())
+        let prefItem = NSMenuItem(title: "启动设置 (IP 与端口)...", action: #selector(openNetworkSettingsDialog), keyEquivalent: ",")
+        prefItem.target = self
+        appMenu.addItem(prefItem)
+        appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(withTitle: "隐藏 \(appName)", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         let hideOthersItem = NSMenuItem(title: "隐藏其他", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
         hideOthersItem.keyEquivalentModifierMask = [.command, .option]
@@ -869,8 +1025,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
             if let data = try? Data(contentsOf: settingsFile),
                var json = try? JSONSerialization.jsonObject(with: data, options: [.mutableContainers, .mutableLeaves]) as? [String: Any] {
                 var server = json["server"] as? [String: Any] ?? [:]
+                var modified = false
                 if (server["openBrowser"] as? String) != "off" {
                     server["openBrowser"] = "off"
+                    modified = true
+                }
+                if (server["port"] as? Int) != targetPort {
+                    server["port"] = targetPort
+                    modified = true
+                }
+                if (server["host"] as? String) != targetHost {
+                    server["host"] = targetHost
+                    modified = true
+                }
+                if modified {
                     json["server"] = server
                     if let updatedData = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]) {
                         try? updatedData.write(to: settingsFile)
@@ -882,7 +1050,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
                 "server": [
                     "openBrowser": "off",
                     "port": targetPort,
-                    "host": "127.0.0.1"
+                    "host": targetHost
                 ]
             ]
             if let initData = try? JSONSerialization.data(withJSONObject: minimalSettings, options: [.prettyPrinted, .sortedKeys]) {
@@ -1277,7 +1445,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         // 绑定 0.0.0.0，允许同一 Wi-Fi 下的 iPhone / iPad 局域网无缝访问
         let proc = Process()
         proc.executableURL = binURL
-        proc.arguments = ["--host=0.0.0.0", "--port=\(targetPort)"]
+        proc.arguments = ["--host=\(targetHost)", "--port=\(targetPort)"]
         proc.qualityOfService = .userInitiated
 
         let homeDir = FileManager.default.homeDirectoryForCurrentUser
