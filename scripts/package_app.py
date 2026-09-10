@@ -126,73 +126,7 @@ def choose_file_macos(initial_dir=""):
         return ""
 
 
-def check_and_repair_database(log_fn=print):
-    """
-    预检并修复 ~/.narrafork/narrafork.db
-    彻底规避 Drizzle ORM 153 号迁移 (0153_tan_bushwacker) 在 SQLite 中因表重命名导致的列解析崩溃
-    """
-    db_path = os.path.expanduser("~/.narrafork/narrafork.db")
-    if not os.path.isfile(db_path):
-        return
 
-    try:
-        import sqlite3
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
-
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='__drizzle_migrations'")
-        if not cur.fetchone():
-            conn.close()
-            return
-
-        cur.execute("SELECT hash FROM __drizzle_migrations")
-        applied = set(r[0] for r in cur.fetchall())
-
-        h153 = "c7b99902ad0e9c6be8886a2959e1b1396a476933996188fac394fe741d1aded6"
-        if h153 not in applied:
-            log_fn("🔧 检测到数据库待升级，正在进行 153 号迁移结构安全对齐...")
-            cur.execute("PRAGMA foreign_keys = OFF")
-            cur.execute("""CREATE TABLE IF NOT EXISTS `__new_file_attributions` (
-                `id` text PRIMARY KEY NOT NULL,
-                `device_id` text DEFAULT 'local' NOT NULL,
-                `workspace_path` text NOT NULL,
-                `file_path` text NOT NULL,
-                `narrator_id` text,
-                `user_id` text,
-                `subagent_type` text,
-                `action` text NOT NULL,
-                `tool_name` text,
-                `tool_use_id` text,
-                `operation_id` text,
-                `effect_id` text,
-                `scope_id` text,
-                `file_key` text,
-                `actor_subject_key` text,
-                `actor_snapshot_json` text,
-                `attribution_grade` text,
-                `lines_added` integer,
-                `lines_removed` integer,
-                `changed_at` text NOT NULL,
-                CONSTRAINT "ck_file_attr_line_counts" CHECK(
-                    ("lines_added" IS NULL OR (typeof("lines_added") = 'integer' AND "lines_added" >= 0))
-                    AND ("lines_removed" IS NULL OR (typeof("lines_removed") = 'integer' AND "lines_removed" >= 0))
-                )
-            )""")
-            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='file_attributions'")
-            if cur.fetchone():
-                cur.execute("PRAGMA table_info(file_attributions)")
-                cols = [r[1] for r in cur.fetchall()]
-                common_cols = [c for c in ["id", "device_id", "workspace_path", "file_path", "narrator_id", "user_id", "subagent_type", "action", "tool_name", "tool_use_id", "lines_added", "lines_removed", "changed_at"] if c in cols]
-                cols_str = ", ".join(f'"{c}"' for c in common_cols)
-                cur.execute(f'INSERT INTO `__new_file_attributions`({cols_str}) SELECT {cols_str} FROM `file_attributions`')
-                cur.execute("DROP TABLE `file_attributions`")
-                cur.execute("ALTER TABLE `__new_file_attributions` RENAME TO `file_attributions`")
-            cur.execute("INSERT OR IGNORE INTO __drizzle_migrations (hash, created_at) VALUES (?, ?)", (h153, 1788757911275))
-            conn.commit()
-            log_fn("✅ 数据库迁移安全兼容预检完成！")
-        conn.close()
-    except Exception as e:
-        log_fn(f"⚠️ 数据库预检提示: {e}")
 
 
 def detect_binary_arch(filepath):
@@ -356,8 +290,7 @@ def build_narrafork_app(
             break
         time.sleep(0.1)
 
-    # 2. 预检数据库迁移健康度
-    check_and_repair_database(log_fn=log_fn)
+
 
     # 2. 准备输出目录
     out_app = DEFAULT_APP_OUTPUT
