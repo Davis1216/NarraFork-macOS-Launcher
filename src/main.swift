@@ -164,7 +164,44 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         }
     }
 
-    // MARK: - Version Rollback & Multi-Version Management (版本回退与多版本管理)
+    // MARK: - Architecture & Multi-Version Management (双芯片架构与多版本管理)
+
+    var currentArch: String {
+        #if arch(arm64)
+        return "arm64"
+        #elseif arch(x86_64)
+        return "x64"
+        #else
+        return "arm64"
+        #endif
+    }
+
+    func detectBinaryArch(at url: URL) -> String {
+        let name = url.lastPathComponent.lowercased()
+        if name.contains("x64") || name.contains("x86_64") || name.contains("intel") {
+            return "x64"
+        }
+        if name.contains("arm64") || name.contains("aarch64") {
+            return "arm64"
+        }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/file")
+        p.arguments = [url.path]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        try? p.run()
+        p.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        if let out = String(data: data, encoding: .utf8) {
+            if out.contains("x86_64") {
+                return "x64"
+            }
+            if out.contains("arm64") {
+                return "arm64"
+            }
+        }
+        return currentArch
+    }
 
     struct VersionEntry {
         let version: String
@@ -203,10 +240,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         // 1. 当前生效的核心
         if let binURL = findBackendBinary(), let ver = getBinaryVersion(at: binURL) {
             currentActiveVersion = ver
-            let targetURL = versionsDir.appendingPathComponent("narrafork-\(ver)-macos-arm64")
+            let arch = detectBinaryArch(at: binURL)
+            let targetURL = versionsDir.appendingPathComponent("narrafork-\(ver)-macos-\(arch)")
             if !fm.fileExists(atPath: targetURL.path) {
                 try? fm.copyItem(at: binURL, to: targetURL)
-                NSLog("NarraFork: 已自动归档当前核心 v%@ 至版本库", ver)
+                NSLog("NarraFork: 已自动归档当前核心 v%@ (%@) 至版本库", ver, arch)
             }
         }
 
@@ -214,7 +252,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         if let resURL = Bundle.main.resourceURL {
             let bundled = resURL.appendingPathComponent("narrafork-backend")
             if fm.fileExists(atPath: bundled.path), let ver = getBinaryVersion(at: bundled) {
-                let targetURL = versionsDir.appendingPathComponent("narrafork-\(ver)-macos-arm64")
+                let arch = detectBinaryArch(at: bundled)
+                let targetURL = versionsDir.appendingPathComponent("narrafork-\(ver)-macos-\(arch)")
                 if !fm.fileExists(atPath: targetURL.path) {
                     try? fm.copyItem(at: bundled, to: targetURL)
                 }
@@ -228,10 +267,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
             for file in files {
                 guard file.lastPathComponent.hasPrefix("narrafork") && !file.lastPathComponent.hasSuffix(".md") else { continue }
                 if let ver = getBinaryVersion(at: file) {
-                    let targetURL = versionsDir.appendingPathComponent("narrafork-\(ver)-macos-arm64")
+                    let arch = detectBinaryArch(at: file)
+                    let targetURL = versionsDir.appendingPathComponent("narrafork-\(ver)-macos-\(arch)")
                     if !fm.fileExists(atPath: targetURL.path) {
                         try? fm.copyItem(at: file, to: targetURL)
-                        NSLog("NarraFork: 已自动收录 bin/ 核心 v%@ 至版本库", ver)
+                        NSLog("NarraFork: 已自动收录 bin/ 核心 v%@ (%@) 至版本库", ver, arch)
                     }
                 }
             }
@@ -250,6 +290,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         if let files = try? fm.contentsOfDirectory(at: versionsDir, includingPropertiesForKeys: [.contentModificationDateKey]) {
             for file in files {
                 guard file.lastPathComponent.hasPrefix("narrafork") && !file.lastPathComponent.hasSuffix(".json") && !file.lastPathComponent.hasSuffix(".txt") else { continue }
+                let name = file.lastPathComponent.lowercased()
+                if self.currentArch == "x64" && name.contains("arm64") {
+                    continue
+                }
                 if let ver = getBinaryVersion(at: file) {
                     let date = (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date()
                     let isCur = (ver == currentActiveVersion)
@@ -446,7 +490,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     @objc func importVersionBinary() {
         let openPanel = NSOpenPanel()
         openPanel.title = "选择要导入的 NarraFork 核心二进制文件"
-        openPanel.message = "请选择官方发布的 macOS arm64/x64 二进制（例如 narrafork-0.7.0-macos-arm64）"
+        openPanel.message = "请选择官方发布的 macOS 核心二进制（当前设备建议: narrafork-*-macos-\(currentArch)）"
         openPanel.prompt = "导入核心"
         openPanel.canChooseFiles = true
         openPanel.canChooseDirectories = false
@@ -465,8 +509,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         let versionsDir = homeDir.appendingPathComponent(".narrafork/versions")
         try? fm.createDirectory(at: versionsDir, withIntermediateDirectories: true)
 
+        let arch = detectBinaryArch(at: sourceURL)
+        if self.currentArch == "x64" && arch == "arm64" {
+            let alert = NSAlert()
+            alert.messageText = "架构不兼容"
+            alert.informativeText = "您当前运行在 Intel (x86_64) Mac 设备上，所选核心为 Apple Silicon (arm64) 架构，无法在当前设备直接运行。\n请选择 macOS x64 架构的核心二进制。"
+            alert.alertStyle = .critical
+            alert.addButton(withTitle: "确定")
+            alert.runModal()
+            return
+        }
+
         let ver = getBinaryVersion(at: sourceURL) ?? "custom"
-        let destURL = versionsDir.appendingPathComponent("narrafork-\(ver)-macos-arm64")
+        let destURL = versionsDir.appendingPathComponent("narrafork-\(ver)-macos-\(arch)")
 
         do {
             if fm.fileExists(atPath: destURL.path) {
@@ -883,9 +938,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         if !isUserPinned,
            let versionFiles = try? fm.contentsOfDirectory(at: versionsDir, includingPropertiesForKeys: nil) {
             let binaries = versionFiles.filter {
-                $0.lastPathComponent.hasPrefix("narrafork") &&
-                !$0.lastPathComponent.hasSuffix(".json") &&
-                !$0.lastPathComponent.hasSuffix(".txt")
+                let name = $0.lastPathComponent.lowercased()
+                if self.currentArch == "x64" && name.contains("arm64") {
+                    return false
+                }
+                return $0.lastPathComponent.hasPrefix("narrafork") &&
+                    !$0.lastPathComponent.hasSuffix(".json") &&
+                    !$0.lastPathComponent.hasSuffix(".txt")
             }
             let currentVer = fm.fileExists(atPath: targetBackend.path) ? (getBinaryVersion(at: targetBackend) ?? "0.0.0") : "0.0.0"
             for b in binaries {
@@ -906,18 +965,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
 
             // 归档旧版本
             if fm.fileExists(atPath: targetBackend.path), let oldVer = getBinaryVersion(at: targetBackend) {
-                let archiveOld = versionsDir.appendingPathComponent("narrafork-\(oldVer)-macos-arm64")
+                let oldArch = detectBinaryArch(at: targetBackend)
+                let archiveOld = versionsDir.appendingPathComponent("narrafork-\(oldVer)-macos-\(oldArch)")
                 if !fm.fileExists(atPath: archiveOld.path) {
                     try? fm.copyItem(at: targetBackend, to: archiveOld)
-                    NSLog("NarraFork: 旧版本 v%@ 已自动归档至版本库: %@", oldVer, archiveOld.path)
+                    NSLog("NarraFork: 旧版本 v%@ (%@) 已自动归档至版本库: %@", oldVer, oldArch, archiveOld.path)
                 }
             }
 
             // 归档新版本至 ~/.narrafork/versions/
-            let archiveNew = versionsDir.appendingPathComponent("narrafork-\(newVer)-macos-arm64")
+            let newArch = detectBinaryArch(at: updateURL)
+            let archiveNew = versionsDir.appendingPathComponent("narrafork-\(newVer)-macos-\(newArch)")
             if !fm.fileExists(atPath: archiveNew.path) && updateURL.path != archiveNew.path {
                 try? fm.copyItem(at: updateURL, to: archiveNew)
-                NSLog("NarraFork: 新版本 v%@ 已同步归档至版本库: %@", newVer, archiveNew.path)
+                NSLog("NarraFork: 新版本 v%@ (%@) 已同步归档至版本库: %@", newVer, newArch, archiveNew.path)
             }
 
             // 部署至 App Bundle 的 narrafork-backend (若有写权限)
@@ -1112,9 +1173,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         // 1. 扫描 ~/.narrafork/versions/ 中的所有版本，寻找最高版本
         if let versionFiles = try? fm.contentsOfDirectory(at: versionsDir, includingPropertiesForKeys: nil) {
             for vf in versionFiles {
+                let name = vf.lastPathComponent.lowercased()
                 guard vf.lastPathComponent.hasPrefix("narrafork") &&
                       !vf.lastPathComponent.hasSuffix(".json") &&
                       !vf.lastPathComponent.hasSuffix(".txt") else { continue }
+                if self.currentArch == "x64" && name.contains("arm64") {
+                    continue
+                }
                 if let v = getBinaryVersion(at: vf) {
                     if candidateVer == nil || v.compare(candidateVer!, options: .numeric) == .orderedDescending {
                         candidateURL = vf
@@ -1146,6 +1211,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
             let sorted = files.filter { $0.lastPathComponent.hasPrefix("narrafork") && !$0.lastPathComponent.hasSuffix(".md") }
                 .sorted { $0.lastPathComponent > $1.lastPathComponent }
             for vf in sorted {
+                if self.currentArch == "x64" && vf.lastPathComponent.lowercased().contains("arm64") {
+                    continue
+                }
                 if let v = getBinaryVersion(at: vf) {
                     if candidateVer == nil || v.compare(candidateVer!, options: .numeric) == .orderedDescending {
                         candidateURL = vf
@@ -1160,6 +1228,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
             let sorted = files.filter { $0.lastPathComponent.hasPrefix("narrafork") && !$0.lastPathComponent.hasSuffix(".app") && !$0.lastPathComponent.hasSuffix(".md") }
                 .sorted { $0.lastPathComponent > $1.lastPathComponent }
             for vf in sorted {
+                if self.currentArch == "x64" && vf.lastPathComponent.lowercased().contains("arm64") {
+                    continue
+                }
                 if let v = getBinaryVersion(at: vf) {
                     if candidateVer == nil || v.compare(candidateVer!, options: .numeric) == .orderedDescending {
                         candidateURL = vf

@@ -1,16 +1,12 @@
-# NarraFork 核心二进制文件存放目录 (Core Binaries)
+# NarraFork 核心二进制文件目录 (bin)
 
-本目录用于存放官方编译的 NarraFork 离线核心服务端二进制文件（如 `narrafork-0.7.0-macos-arm64`）。
+此目录专门用于存放从官方渠道下载的 NarraFork 核心后端二进制文件。
 
-### 📥 核心获取与使用方法
+### 📌 支持芯片架构
+- **Apple Silicon 芯片 (M系列)**：例如 `narrafork-0.7.2-macos-arm64`
+- **Intel 芯片 (x86_64)**：例如 `narrafork-0.7.2-macos-x64`
 
-1. **下载或放置核心文件**：
-   - 将下载得到的 macOS 核心可执行文件（例如 `narrafork-0.7.0-macos-arm64`）直接放入本 `bin/` 目录中。
-   - 文件名需包含版本号及架构（例如包含 `narrafork` 和 `macos`）。
-
-2. **自动识别打包**：
-   - 项目根目录下的 `一键打包App.command` 会自动优先扫描并捕获本目录中最新版本的核心二进制。
-   - 打包脚本会自动为二进制赋予执行权限 (`chmod +x`) 并完成 macOS 隔离属性清理 (`xattr -cr`)。
-
-3. **版本保留**：
-   - 本目录已在 `.gitignore` 中配置忽略实际可执行文件，防止将数十兆的二进制产物提交至 Git 仓库。
+### 📌 使用说明
+1. 从官方下载对应架构的新版本核心。
+2. 将下载的文件直接移动或复制到本 `bin/` 目录下。
+3. 运行根目录下的 **`一键打包App.command`**（或命令行 `python3 scripts/package_app.py --arch all`），打包工具会自动扫描并识别此目录下的文件，一键完成对应架构或双架构打包！

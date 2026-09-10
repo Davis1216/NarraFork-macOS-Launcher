@@ -195,13 +195,35 @@ def check_and_repair_database(log_fn=print):
         log_fn(f"⚠️ 数据库预检提示: {e}")
 
 
-def build_dmg(app_path, ver, log_fn=print):
+def detect_binary_arch(filepath):
+    """检测二进制架构 (arm64 或 x64)"""
+    if not filepath or not os.path.isfile(filepath):
+        return "arm64"
+    fn = os.path.basename(filepath).lower()
+    if "x64" in fn or "x86_64" in fn or "intel" in fn:
+        return "x64"
+    if "arm64" in fn or "aarch64" in fn:
+        return "arm64"
+    try:
+        res = subprocess.run(["file", filepath], capture_output=True, text=True)
+        if "x86_64" in res.stdout:
+            return "x64"
+        if "arm64" in res.stdout:
+            return "arm64"
+    except Exception:
+        pass
+    return "arm64"
+
+
+def build_dmg(app_path, ver, arch="arm64", log_fn=print):
     """构建精美、纯中文界面与全中文使用说明的 macOS DMG 安装镜像 (支持 dmgbuild / create-dmg 双引擎)"""
-    dmg_output = os.path.join(DIST_DIR, f"NarraFork-v{ver}-macOS-arm64.dmg")
+    arch_tag = "x64" if arch.lower() in ("x64", "x86_64", "intel") else "arm64"
+    arch_display = "Intel 芯片" if arch_tag == "x64" else "Apple Silicon"
+    dmg_output = os.path.join(DIST_DIR, f"NarraFork-v{ver}-macOS-{arch_tag}.dmg")
     bg_path = os.path.join(ASSETS_DIR, "dmg_background.png")
     readme_path = os.path.join(ASSETS_DIR, "安装使用必读.txt")
 
-    log_fn(f"\n📀 正在构建精美中文 DMG 安装包: {os.path.basename(dmg_output)}...")
+    log_fn(f"\n📀 正在构建精美中文 DMG 安装包: {os.path.basename(dmg_output)} ({arch_display})...")
 
     # 1. 优先采用现代化 dmgbuild 直接二进制写入 .DS_Store (完美兼容 macOS Sonoma/Sequoia 视网膜背景)
     try:
@@ -218,7 +240,7 @@ def build_dmg(app_path, ver, log_fn=print):
         DSStore.Partial.__setitem__ = patched_ds_setitem
 
         settings = {
-            "volume_name": "NarraFork 安装程序",
+            "volume_name": f"NarraFork 安装程序 ({arch_display})",
             "icon": ICON_PATH if os.path.isfile(ICON_PATH) else None,
             "background": bg_path if os.path.isfile(bg_path) else None,
             "icon_size": 105,
@@ -245,7 +267,7 @@ def build_dmg(app_path, ver, log_fn=print):
         if os.path.exists(dmg_output):
             os.remove(dmg_output)
 
-        dmgbuild.build_dmg(dmg_output, "NarraFork 安装程序", settings=settings)
+        dmgbuild.build_dmg(dmg_output, f"NarraFork 安装程序 ({arch_display})", settings=settings)
         if os.path.isfile(dmg_output):
             log_fn(f"✅ 中文 DMG 安装镜像构建成功 (dmgbuild 原生引擎): {dmg_output}")
             return dmg_output
@@ -256,7 +278,7 @@ def build_dmg(app_path, ver, log_fn=print):
 
     # 2. 备用引擎: create-dmg
     if shutil.which("create-dmg"):
-        staging_dir = "/tmp/narrafork_dmg_staging"
+        staging_dir = f"/tmp/narrafork_dmg_staging_{arch_tag}"
         if os.path.exists(staging_dir):
             shutil.rmtree(staging_dir)
         os.makedirs(staging_dir, exist_ok=True)
@@ -264,7 +286,7 @@ def build_dmg(app_path, ver, log_fn=print):
 
         cmd = [
             "create-dmg",
-            "--volname", "NarraFork 安装程序",
+            "--volname", f"NarraFork 安装程序 ({arch_display})",
             "--volicon", ICON_PATH,
             "--background", bg_path,
             "--window-pos", "200", "120",
@@ -302,6 +324,7 @@ def build_narrafork_app(
     update_desktop_shortcut=True,
     reveal_in_finder=True,
     create_dmg_installer=True,
+    target_arch=None,
     log_fn=print,
 ):
     """执行核心打包流程"""
@@ -309,8 +332,11 @@ def build_narrafork_app(
         raise ValueError(f"指定的二进制文件不存在: {selected_binary}")
 
     ver = extract_version(selected_binary)
+    arch = target_arch or detect_binary_arch(selected_binary)
+    arch_display = "Intel 芯片 (x64)" if arch == "x64" else "Apple Silicon (arm64)"
+
     log_fn(f"\n========================================")
-    log_fn(f"🚀 开始构建 NarraFork v{ver} 客户端...")
+    log_fn(f"🚀 开始构建 NarraFork v{ver} 客户端 [{arch_display}]...")
 
     # 1. 检查并终止正在运行的旧实例
     log_fn("🔍 检查并安全退出正在运行的 NarraFork 实例...")
@@ -345,19 +371,28 @@ def build_narrafork_app(
     os.makedirs(macos_dir, exist_ok=True)
     os.makedirs(res_dir, exist_ok=True)
 
-    # 3. 部署应用外壳二进制 (带状态栏常驻守护)
+    # 3. 部署应用外壳二进制 (优先采用双架构通用二进制 Universal 2)
     target_wrapper = os.path.join(macos_dir, "NarraFork")
     if os.path.isfile(WRAPPER_BIN_PATH):
         log_fn("⚡ 部署原生防误触状态栏外壳 (NarraFork_wrapper)...")
         shutil.copy2(WRAPPER_BIN_PATH, target_wrapper)
     else:
-        log_fn("🔨 从源码编译原生外壳 (src/main.swift)...")
+        log_fn("🔨 从源码编译 Universal 2 原生外壳 (src/main.swift)...")
         if not os.path.isfile(SWIFT_SRC_PATH):
             raise RuntimeError(f"未找到源码文件: {SWIFT_SRC_PATH}")
-        cmd = ["swiftc", "-O", "-target", "arm64-apple-macos12.0", SWIFT_SRC_PATH, "-o", target_wrapper]
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode != 0:
-            raise RuntimeError(f"Swift 编译失败: {res.stderr}")
+        tmp_arm = "/tmp/NarraFork_wrapper_arm64"
+        tmp_x64 = "/tmp/NarraFork_wrapper_x86_64"
+        cmd_arm = ["swiftc", "-O", "-target", "arm64-apple-macos12.0", "-framework", "Cocoa", "-framework", "WebKit", SWIFT_SRC_PATH, "-o", tmp_arm]
+        cmd_x64 = ["swiftc", "-O", "-target", "x86_64-apple-macos12.0", "-framework", "Cocoa", "-framework", "WebKit", SWIFT_SRC_PATH, "-o", tmp_x64]
+        res_arm = subprocess.run(cmd_arm, capture_output=True, text=True)
+        res_x64 = subprocess.run(cmd_x64, capture_output=True, text=True)
+        if res_arm.returncode == 0 and res_x64.returncode == 0:
+            subprocess.run(["lipo", "-create", tmp_arm, tmp_x64, "-output", target_wrapper], check=True)
+            shutil.copy2(target_wrapper, WRAPPER_BIN_PATH)
+        elif res_arm.returncode == 0:
+            shutil.copy2(tmp_arm, target_wrapper)
+        else:
+            raise RuntimeError(f"Swift 编译失败: {res_arm.stderr}")
     os.chmod(target_wrapper, 0o755)
 
     # 4. 植入官方高清原生图标 (AppIcon.icns)
@@ -415,7 +450,7 @@ def build_narrafork_app(
         try:
             versions_dir = os.path.expanduser("~/.narrafork/versions")
             os.makedirs(versions_dir, exist_ok=True)
-            archived_bin = os.path.join(versions_dir, f"narrafork-{ver}-macos-arm64")
+            archived_bin = os.path.join(versions_dir, f"narrafork-{ver}-macos-{arch}")
             if not os.path.isfile(archived_bin):
                 shutil.copy2(target_backend, archived_bin)
                 os.chmod(archived_bin, 0o755)
@@ -435,7 +470,7 @@ def build_narrafork_app(
     # 10. 生成精美中文 DMG 安装镜像 (如果启用)
     dmg_file = None
     if create_dmg_installer:
-        dmg_file = build_dmg(out_app, ver, log_fn=log_fn)
+        dmg_file = build_dmg(out_app, ver, arch=arch, log_fn=log_fn)
 
     # 11. 刷新系统图标缓存
     log_fn("🔄 刷新 Finder / Dock 图标缓存...")
@@ -854,9 +889,11 @@ class AppPackagerUI(tk.Tk):
         self.path_var.set(filepath)
         size_mb = os.path.getsize(filepath) / (1024 * 1024)
         ver = extract_version(filepath)
-        self.info_var.set(f"✅ 已选中: {os.path.basename(filepath)}  |  大小: {size_mb:.1f} MB  |  识别版本: v{ver}")
+        arch = detect_binary_arch(filepath)
+        arch_display = "💻 Intel 芯片 (x64)" if arch == "x64" else "🍎 Apple Silicon (arm64)"
+        self.info_var.set(f"✅ 已选中: {os.path.basename(filepath)}  |  架构: {arch_display}  |  大小: {size_mb:.1f} MB  |  版本: v{ver}")
         self.info_lbl.config(fg="#1a7f37")
-        self.log(f"已选定核心文件: {filepath} (v{ver})")
+        self.log(f"已选定核心文件: {filepath} (v{ver}, 架构: {arch_display})")
 
     def start_packaging_thread(self):
         if not self.selected_binary or not os.path.isfile(self.selected_binary):
@@ -877,15 +914,17 @@ class AppPackagerUI(tk.Tk):
                 create_dmg_installer=self.opt_create_dmg.get(),
                 log_fn=self.log,
             )
-            dmg_msg = f"\n• 中文 DMG 镜像: {dmg_file} (可直接分享)" if dmg_file else ""
+            arch = detect_binary_arch(self.selected_binary)
+            arch_display = "Intel 芯片 (x64)" if arch == "x64" else "Apple Silicon (arm64)"
+            dmg_msg = f"\n• 中文 DMG 镜像: {dmg_file} (支持 {arch_display})" if dmg_file else ""
             self.after(
                 100,
                 lambda: messagebox.showinfo(
                     "打包完成",
-                    f"🎉 NarraFork v{ver} 客户端已成功打包并部署！\n\n"
+                    f"🎉 NarraFork v{ver} [{arch_display}] 客户端已成功打包并部署！\n\n"
                     f"• 本地 App: {deployed_app}{dmg_msg}\n"
-                    f"• 图标样式: 官方原生 Logo\n"
-                    f"• 防误触特性: 点击红色 X 仅最小化至顶端状态栏\n"
+                    f"• 外壳支持: Universal 2 (原生支持 Apple Silicon & Intel 双架构)\n"
+                    f"• 核心架构: {arch_display}\n"
                     f"• 桌面快捷方式: 已自动更新\n\n现在可直接双击运行，或将 DMG 分享给其他 Mac 用户！",
                     parent=self,
                 ),
@@ -901,13 +940,97 @@ class AppPackagerUI(tk.Tk):
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] == "--cli":
-        if len(sys.argv) < 3:
-            print("用法: python3 package_app.py --cli <核心二进制路径>")
-            sys.exit(1)
-        build_narrafork_app(sys.argv[2], reveal_in_finder=False)
+    import argparse
+    parser = argparse.ArgumentParser(description="NarraFork macOS Launcher 打包工具 (支持 Apple Silicon & Intel 芯片)")
+    parser.add_argument("binary", nargs="?", help="核心二进制文件路径")
+    parser.add_argument("--cli", action="store_true", help="以命令行模式直接打包 (不启动 GUI)")
+    parser.add_argument("--arch", choices=["arm64", "x64", "all"], help="指定构建芯片架构 (arm64: Apple Silicon, x64: Intel, all: 双架构同时构建)")
+    parser.add_argument("--no-dmg", action="store_true", help="不生成 DMG 安装镜像")
+    parser.add_argument("--no-install", action="store_true", help="不安装到 /Applications")
+    
+    args, unknown = parser.parse_known_args()
+
+    # 兼容原生旧调用格式: python3 package_app.py --cli <path>
+    target_bin = None
+    if args.binary:
+        target_bin = args.binary
+    elif unknown:
+        for u in unknown:
+            if os.path.isfile(u):
+                target_bin = u
+                break
+
+    if args.cli or args.arch:
+        if args.arch == "all":
+            print("\n🌟 正在执行双芯片架构全量构建 (Apple Silicon arm64 + Intel x64)...")
+            built_count = 0
+            arm_bin = None
+            x64_bin = None
+            for root in [BIN_DIR, PROJECT_ROOT, os.path.expanduser("~/Downloads")]:
+                if not os.path.isdir(root): continue
+                for f in os.listdir(root):
+                    fp = os.path.join(root, f)
+                    if not os.path.isfile(fp) or f.endswith(".md") or f.endswith(".json"): continue
+                    if "narrafork" in f.lower():
+                        detected = detect_binary_arch(fp)
+                        if detected == "arm64" and (not arm_bin or os.path.getmtime(fp) > os.path.getmtime(arm_bin)):
+                            arm_bin = fp
+                        elif detected == "x64" and (not x64_bin or os.path.getmtime(fp) > os.path.getmtime(x64_bin)):
+                            x64_bin = fp
+
+            if arm_bin:
+                print(f"\n▶ 正在为 Apple Silicon (arm64) 构建安装包: {arm_bin}")
+                build_narrafork_app(arm_bin, create_dmg_installer=not args.no_dmg, install_to_applications=not args.no_install, reveal_in_finder=False)
+                built_count += 1
+            else:
+                print("⚠️ 未找到 arm64 核心文件，跳过 arm64 构建")
+
+            if x64_bin:
+                print(f"\n▶ 正在为 Intel (x64) 构建安装包: {x64_bin}")
+                build_narrafork_app(x64_bin, create_dmg_installer=not args.no_dmg, install_to_applications=False, update_desktop_shortcut=False, reveal_in_finder=False)
+                built_count += 1
+            else:
+                print("⚠️ 未找到 x64 核心文件，跳过 x64 构建 (请在 bin/ 放入 narrafork-*-macos-x64)")
+
+            print(f"\n🎉 构建流程结束，成功构建 {built_count} 个架构版本！产物位于 dist/ 目录。")
+            return
+        elif args.arch == "x64" or (target_bin and detect_binary_arch(target_bin) == "x64"):
+            x64_bin = target_bin
+            if not x64_bin:
+                for root in [BIN_DIR, PROJECT_ROOT, os.path.expanduser("~/Downloads")]:
+                    if not os.path.isdir(root): continue
+                    for f in os.listdir(root):
+                        fp = os.path.join(root, f)
+                        if os.path.isfile(fp) and "narrafork" in f.lower() and detect_binary_arch(fp) == "x64":
+                            if not x64_bin or os.path.getmtime(fp) > os.path.getmtime(x64_bin):
+                                x64_bin = fp
+            if not x64_bin or not os.path.isfile(x64_bin):
+                print("❌ 错误: 未找到适用于 Intel (x64) 的 NarraFork 核心二进制文件。")
+                print("💡 请将官方发布的 narrafork-*-macos-x64 放入 bin/ 目录后重试。")
+                sys.exit(1)
+            print(f"💻 正在为 Intel 芯片 (x64) 构建安装包: {x64_bin}")
+            build_narrafork_app(x64_bin, create_dmg_installer=not args.no_dmg, install_to_applications=False, update_desktop_shortcut=False, reveal_in_finder=False)
+            return
+        elif target_bin:
+            build_narrafork_app(target_bin, create_dmg_installer=not args.no_dmg, reveal_in_finder=False)
+            return
+        else:
+            candidates = []
+            for root in [BIN_DIR, PROJECT_ROOT]:
+                if os.path.isdir(root):
+                    for f in os.listdir(root):
+                        fp = os.path.join(root, f)
+                        if os.path.isfile(fp) and "narrafork" in f.lower() and not f.endswith(".md") and not f.endswith(".json"):
+                            candidates.append(fp)
+            if candidates:
+                candidates.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+                build_narrafork_app(candidates[0], reveal_in_finder=False)
+                return
+            else:
+                print("用法: python3 package_app.py --cli <核心二进制路径> [--arch arm64|x64|all]")
+                sys.exit(1)
     else:
-        preselected = sys.argv[1] if len(sys.argv) > 1 else None
+        preselected = target_bin
         gui = AppPackagerUI(preselected=preselected)
         gui.mainloop()
 

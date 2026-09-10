@@ -141,9 +141,14 @@ narrafork/
 
 ### 第一步：准备 NarraFork 核心文件
 
-将官方发布的 macOS 核心可执行文件（例如 `narrafork-0.7.0-macos-arm64`）拷贝至本项目的 `bin/` 目录中：
+将官方发布的 macOS 核心可执行文件拷贝至本项目的 `bin/` 目录中：
+- **Apple Silicon (M系列)**：`bin/narrafork-*-macos-arm64`
+- **Intel 芯片 (x86_64)**：`bin/narrafork-*-macos-x64`
+
 ```bash
-cp /path/to/narrafork-0.7.0-macos-arm64 bin/
+# 拷贝对应架构核心至 bin/ 目录
+cp /path/to/narrafork-*-macos-arm64 bin/   # 适用于 M1/M2/M3/M4 系列
+cp /path/to/narrafork-*-macos-x64 bin/     # 适用于 Intel 系列 Mac
 ```
 *(打包器也支持自动检测本地 `~/Downloads` 或历史 App 内下载的更新核心)*
 
@@ -154,14 +159,20 @@ cp /path/to/narrafork-0.7.0-macos-arm64 bin/
 #### 方式 A：GUI 可视化打包（推荐，最省心）
 直接双击项目根目录下的 **`一键打包App.command`**。
 * 程序会自动弹出清爽的中文打包面板；
-* 自动锁定 `bin/` 目录中的最新核心，并展示文件版本与体积；
-* 勾选打包选项（覆盖安装到系统应用、更新桌面快捷方式、生成中文 DMG）；
+* 自动识别核心芯片架构（**Apple Silicon arm64** 或 **Intel x64**）；
+* 勾选打包选项（覆盖安装到系统应用、更新桌面快捷方式、生成对应架构的中文 DMG）；
 * 点击 **🚀 开始一键打包 NarraFork.app**，数秒内即可完成！
 
-#### 方式 B：终端命令行打包（适合自动化 CI/CD 流水线）
+#### 方式 B：终端命令行打包（支持双架构与自动化流水线）
 ```bash
-# 语法：python3 scripts/package_app.py --cli <核心文件路径>
-python3 scripts/package_app.py --cli bin/narrafork-0.7.0-macos-arm64
+# 1. 基础打包（自动识别二进制架构）：
+python3 scripts/package_app.py --cli bin/narrafork-0.7.2-macos-arm64
+
+# 2. 指定为 Intel (x64) 芯片打包：
+python3 scripts/package_app.py --arch x64
+
+# 3. 双架构全量构建（一键同时输出 arm64 与 x64 两款独立安装包）：
+python3 scripts/package_app.py --arch all
 ```
 
 ---
@@ -171,10 +182,11 @@ python3 scripts/package_app.py --cli bin/narrafork-0.7.0-macos-arm64
 打包完成后，在 `dist/` 目录下将生成两个关键产物：
 1. **`dist/NarraFork.app`**：
    - 完整的 macOS 原生应用程序 Bundle；
+   - 原生外壳基于 **Universal 2** 双架构编译，原生无缝适配 Apple Silicon 与 Intel 芯片；
    - 已完成本地自签名（`codesign`）并清理安全隔离属性；
    - 包含官方 Logo、防误触状态栏常驻特性、内嵌脱敏纯净数据库。
-2. **`dist/NarraFork-v<版本>-macOS-arm64.dmg`**：
-   - 经过专业排版的精美 DMG 安装镜像；
+2. **`dist/NarraFork-v<版本>-macOS-arm64.dmg` / `dist/NarraFork-v<版本>-macOS-x64.dmg`**：
+   - 对应芯片架构专属定制的精美中文 DMG 安装镜像；
    - 打开后呈现左侧 App、右侧 Applications、中间导向箭头与底部《安装使用必读.txt》；
    - 可直接通过网盘、GitHub Release 或 AirDrop 分享给其他 Mac 用户。
 
