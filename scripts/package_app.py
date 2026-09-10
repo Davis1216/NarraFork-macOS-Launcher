@@ -316,9 +316,16 @@ def build_narrafork_app(
     log_fn("🔍 检查并安全退出正在运行的 NarraFork 实例...")
     subprocess.run(["killall", "NarraFork"], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
     subprocess.run(["killall", "narrafork-backend"], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+    try:
+        res = subprocess.run(["lsof", "-ti", ":7788"], capture_output=True, text=True)
+        if res.stdout.strip():
+            for pid_s in res.stdout.strip().split():
+                subprocess.run(["kill", "-9", pid_s], stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
     import time
     for _ in range(15):
-        res = subprocess.run(["pgrep", "-f", "narrafork-backend"], capture_output=True, text=True)
+        res = subprocess.run(["lsof", "-ti", ":7788"], capture_output=True, text=True)
         if not res.stdout.strip():
             break
         time.sleep(0.1)

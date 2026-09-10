@@ -12,7 +12,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     var statusItem: NSStatusItem?
     var versionMenuItem: NSMenuItem?
     var versionSubmenu: NSMenu?
-    var currentActiveVersion: String = "0.7.0"
+    var currentActiveVersion: String = "0.7.2"
+    var isAppTerminating: Bool = false
     var activityToken: NSObjectProtocol?
 
     var targetURL: URL {
@@ -30,6 +31,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         setupMenu()
         setupStatusItem()
         setupWindow()
+        checkAndApplyPlacedUpdate()
+        resolveActiveCoreVersion()
         loadSplashScreen()
         checkAndStartBackend()
     }
@@ -137,19 +140,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
 
     @objc func restartCoreBackend() {
         checkTimer?.invalidate()
-        if let proc = backendProcess, proc.isRunning {
-            proc.terminate()
-            let deadline = Date().addingTimeInterval(1.0)
-            while proc.isRunning && Date() < deadline {
-                usleep(50_000)
-            }
+        if let proc = backendProcess {
+            proc.terminationHandler = nil
             if proc.isRunning {
-                kill(proc.processIdentifier, SIGKILL)
+                proc.terminate()
+                let deadline = Date().addingTimeInterval(1.0)
+                while proc.isRunning && Date() < deadline {
+                    usleep(50_000)
+                }
+                if proc.isRunning {
+                    kill(proc.processIdentifier, SIGKILL)
+                }
             }
         }
+        backendProcess = nil
+        killAnyProcessOnPort(port: targetPort)
         checkAndApplyPlacedUpdate()
-        loadSplashScreen(status: "正在重启核心服务...")
-        launchBackendProcess()
+        resolveActiveCoreVersion()
+        clearWebViewCache { [weak self] in
+            guard let self = self else { return }
+            self.loadSplashScreen(status: "正在重启核心服务...")
+            self.launchBackendProcess()
+        }
     }
 
     // MARK: - Version Rollback & Multi-Version Management (版本回退与多版本管理)
@@ -255,14 +267,34 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         return versionsMap.values.sorted { $0.version.compare($1.version, options: .numeric) == .orderedDescending }
     }
 
-    func refreshVersionSubmenu() {
-        guard let submenu = versionSubmenu else { return }
-        submenu.removeAllItems()
-
+    func resolveActiveCoreVersion() {
         if let activeURL = findBackendBinary(), let ver = getBinaryVersion(at: activeURL) {
             currentActiveVersion = ver
         }
         versionMenuItem?.title = "核心版本回退与切换 (当前: v\(currentActiveVersion))"
+    }
+
+    func refreshVersionSubmenu() {
+        guard let submenu = versionSubmenu else { return }
+        submenu.removeAllItems()
+
+        resolveActiveCoreVersion()
+
+        let homeDir = FileManager.default.homeDirectoryForCurrentUser
+        let activeJsonURL = homeDir.appendingPathComponent(".narrafork/active_version.json")
+        var isPinned = false
+        if let data = try? Data(contentsOf: activeJsonURL),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let p = json["isPinned"] as? Bool, p {
+            isPinned = true
+        }
+
+        if isPinned {
+            let resetItem = NSMenuItem(title: "⚡ 恢复自动使用最新版本核心", action: #selector(resetToLatestVersion), keyEquivalent: "")
+            resetItem.target = self
+            submenu.addItem(resetItem)
+            submenu.addItem(NSMenuItem.separator())
+        }
 
         let entries = scanAvailableVersions()
         if entries.isEmpty {
@@ -272,7 +304,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         } else {
             for entry in entries {
                 let isCurrent = (entry.version == currentActiveVersion)
-                let itemTitle = isCurrent ? "✓ v\(entry.version) (当前运行中)" : "   v\(entry.version) (点击回退至此版本)"
+                let itemTitle = isCurrent ? "✓ v\(entry.version) (当前运行中)" : "   v\(entry.version) (点击切换至此版本)"
                 let item = NSMenuItem(title: itemTitle, action: isCurrent ? nil : #selector(handleVersionSwitch(_:)), keyEquivalent: "")
                 item.target = self
                 item.state = isCurrent ? .on : .off
@@ -290,6 +322,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         let openDirItem = NSMenuItem(title: "📂 打开版本备份目录 (~/.narrafork/versions)", action: #selector(openVersionsFolder), keyEquivalent: "")
         openDirItem.target = self
         submenu.addItem(openDirItem)
+    }
+
+    @objc func resetToLatestVersion() {
+        let homeDir = FileManager.default.homeDirectoryForCurrentUser
+        let activeJsonURL = homeDir.appendingPathComponent(".narrafork/active_version.json")
+        try? FileManager.default.removeItem(at: activeJsonURL)
+        checkAndApplyPlacedUpdate()
+        resolveActiveCoreVersion()
+        loadSplashScreen(status: "正在切换回最新版本核心 (v\(currentActiveVersion))...")
+        restartCoreBackend()
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -342,23 +384,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
 
         // 2. 优雅停止当前正在运行的后端
         checkTimer?.invalidate()
-        if let proc = backendProcess, proc.isRunning {
-            proc.terminate()
-            let deadline = Date().addingTimeInterval(1.2)
-            while proc.isRunning && Date() < deadline {
-                usleep(50_000)
-            }
+        if let proc = backendProcess {
+            proc.terminationHandler = nil
             if proc.isRunning {
-                kill(proc.processIdentifier, SIGKILL)
+                proc.terminate()
+                let deadline = Date().addingTimeInterval(1.2)
+                while proc.isRunning && Date() < deadline {
+                    usleep(50_000)
+                }
+                if proc.isRunning {
+                    kill(proc.processIdentifier, SIGKILL)
+                }
             }
         }
         backendProcess = nil
+        killAnyProcessOnPort(port: targetPort)
 
-        // 3. 记录当前激活版本到 ~/.narrafork/active_version.json
+        // 3. 记录当前激活版本到 ~/.narrafork/active_version.json (标记为用户显式 Pin)
         let activeJsonURL = homeDir.appendingPathComponent(".narrafork/active_version.json")
         let activeInfo: [String: Any] = [
             "version": toVersion,
             "binaryPath": binaryPath,
+            "isPinned": true,
             "switchedAt": ISO8601DateFormatter().string(from: Date())
         ]
         if let data = try? JSONSerialization.data(withJSONObject: activeInfo, options: [.prettyPrinted]) {
@@ -386,11 +433,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
             }
         }
 
-        // 5. 显示加载界面并拉起新版本
-        currentActiveVersion = toVersion
-        loadSplashScreen(status: "正在以 v\(toVersion) 重新启动核心服务...")
-        launchBackendProcess()
-        refreshVersionSubmenu()
+        // 5. 清理 WebKit 网页缓存（彻底避免因版本切换导致旧模块脚本与新核心资源哈希不匹配引发 "Importing a module script failed"）
+        clearWebViewCache { [weak self] in
+            guard let self = self else { return }
+            self.currentActiveVersion = toVersion
+            self.loadSplashScreen(status: "正在以 v\(toVersion) 重新启动核心服务...")
+            self.launchBackendProcess()
+            self.refreshVersionSubmenu()
+        }
     }
 
     @objc func importVersionBinary() {
@@ -464,7 +514,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         NSWorkspace.shared.open(versionsDir)
     }
 
+    func clearWebViewCache(completion: (() -> Void)? = nil) {
+        let types: Set<String> = [
+            WKWebsiteDataTypeDiskCache,
+            WKWebsiteDataTypeMemoryCache,
+            WKWebsiteDataTypeOfflineWebApplicationCache,
+            WKWebsiteDataTypeServiceWorkerRegistrations
+        ]
+        WKWebsiteDataStore.default().removeData(ofTypes: types, modifiedSince: Date.distantPast) {
+            completion?()
+        }
+    }
+
     @objc func quitApplication() {
+        isAppTerminating = true
+        checkTimer?.invalidate()
+        if let proc = backendProcess, proc.isRunning {
+            proc.terminate()
+        }
         NSApp.terminate(nil)
     }
 
@@ -588,7 +655,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     }
 
     func loadSplashScreen(status: String = "正在启动本地核心服务...") {
-        let appVer = currentActiveVersion.isEmpty ? (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.7.0") : currentActiveVersion
+        let appVer = currentActiveVersion.isEmpty ? "0.7.2" : currentActiveVersion
         let displayVersion = appVer.hasPrefix("v") ? appVer : "v\(appVer)"
         let html = """
         <!DOCTYPE html>
@@ -724,7 +791,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
             </div>
           </div>
           <div class="footer">
-            <div class="footer-version">NarraFork macOS Launcher \(displayVersion)</div>
+            <div class="footer-version">NarraFork \(displayVersion)</div>
             <div class="footer-copyright">
               <span>NarraFork macOS Launcher 由 <strong>Davis</strong> 制作</span>
               <span class="footer-divider">•</span>
@@ -776,87 +843,231 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
         let versionsDir = homeDir.appendingPathComponent(".narrafork/versions")
         try? fm.createDirectory(at: versionsDir, withIntermediateDirectories: true)
 
-        let updateJsonURL = homeDir.appendingPathComponent(".narrafork/updates/placed-update.json")
-        guard let data = try? Data(contentsOf: updateJsonURL),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let newPath = json["newBinaryPath"] as? String else {
-            return
-        }
-
-        // 检查下载的新二进制是否存在
-        guard fm.fileExists(atPath: newPath) else { return }
-
-        // 确定 App 内嵌目标路径
         guard let resURL = Bundle.main.resourceURL else { return }
         let targetBackend = resURL.appendingPathComponent("narrafork-backend")
 
-        if newPath == targetBackend.path {
-            try? fm.removeItem(at: updateJsonURL)
-            return
+        // 1. 检查是否存在来自官方更新的 placed-update.json
+        let updateJsonURL = homeDir.appendingPathComponent(".narrafork/updates/placed-update.json")
+        var candidateUpdateURL: URL? = nil
+
+        if let data = try? Data(contentsOf: updateJsonURL),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let newPath = json["newBinaryPath"] as? String,
+           fm.fileExists(atPath: newPath) {
+            candidateUpdateURL = URL(fileURLWithPath: newPath)
         }
 
-        NSLog("NarraFork: 检测到已下载热更新 %@，正在归档并同步至 %@", newPath, targetBackend.path)
-
-        // 1. 自动备份归档当前旧版本 (Archive current version before replacing)
-        if fm.fileExists(atPath: targetBackend.path), let oldVer = getBinaryVersion(at: targetBackend) {
-            let archiveOld = versionsDir.appendingPathComponent("narrafork-\(oldVer)-macos-arm64")
-            if !fm.fileExists(atPath: archiveOld.path) {
-                try? fm.copyItem(at: targetBackend, to: archiveOld)
-                NSLog("NarraFork: 旧版本 v%@ 已自动归档至版本库: %@", oldVer, archiveOld.path)
+        // 2. 检查 App Bundle Resources 目录下是否有官方下载的 narrafork-*-macos-arm64
+        if candidateUpdateURL == nil,
+           let resFiles = try? fm.contentsOfDirectory(at: resURL, includingPropertiesForKeys: nil) {
+            let updateFiles = resFiles.filter {
+                $0.lastPathComponent.hasPrefix("narrafork-") &&
+                $0.lastPathComponent != "narrafork-backend" &&
+                !$0.lastPathComponent.hasSuffix(".db") &&
+                !$0.lastPathComponent.hasSuffix(".icns")
+            }
+            if let newest = updateFiles.sorted(by: { $0.lastPathComponent > $1.lastPathComponent }).first {
+                candidateUpdateURL = newest
             }
         }
 
-        // 2. 自动归档即将应用的新版本 (Archive incoming new version)
-        if let newVer = getBinaryVersion(at: URL(fileURLWithPath: newPath)) {
+        // 3. 检查 ~/.narrafork/versions/ 中是否有更高版本（且用户未固定回退）
+        let activeJsonURL = homeDir.appendingPathComponent(".narrafork/active_version.json")
+        var isUserPinned = false
+        if let data = try? Data(contentsOf: activeJsonURL),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let pinned = json["isPinned"] as? Bool, pinned {
+            isUserPinned = true
+        }
+
+        if !isUserPinned,
+           let versionFiles = try? fm.contentsOfDirectory(at: versionsDir, includingPropertiesForKeys: nil) {
+            let binaries = versionFiles.filter {
+                $0.lastPathComponent.hasPrefix("narrafork") &&
+                !$0.lastPathComponent.hasSuffix(".json") &&
+                !$0.lastPathComponent.hasSuffix(".txt")
+            }
+            let currentVer = fm.fileExists(atPath: targetBackend.path) ? (getBinaryVersion(at: targetBackend) ?? "0.0.0") : "0.0.0"
+            for b in binaries {
+                if let v = getBinaryVersion(at: b) {
+                    if v.compare(currentVer, options: .numeric) == .orderedDescending {
+                        if candidateUpdateURL == nil || v.compare(getBinaryVersion(at: candidateUpdateURL!) ?? "0.0.0", options: .numeric) == .orderedDescending {
+                            candidateUpdateURL = b
+                        }
+                    }
+                }
+            }
+        }
+
+        // 如果找到了更新的核心文件，执行原子部署与同步归档
+        if let updateURL = candidateUpdateURL, updateURL.path != targetBackend.path {
+            guard let newVer = getBinaryVersion(at: updateURL) else { return }
+            NSLog("NarraFork: 检测到更高版本核心 v%@ (%@)，正在应用...", newVer, updateURL.path)
+
+            // 归档旧版本
+            if fm.fileExists(atPath: targetBackend.path), let oldVer = getBinaryVersion(at: targetBackend) {
+                let archiveOld = versionsDir.appendingPathComponent("narrafork-\(oldVer)-macos-arm64")
+                if !fm.fileExists(atPath: archiveOld.path) {
+                    try? fm.copyItem(at: targetBackend, to: archiveOld)
+                    NSLog("NarraFork: 旧版本 v%@ 已自动归档至版本库: %@", oldVer, archiveOld.path)
+                }
+            }
+
+            // 归档新版本至 ~/.narrafork/versions/
             let archiveNew = versionsDir.appendingPathComponent("narrafork-\(newVer)-macos-arm64")
-            if !fm.fileExists(atPath: archiveNew.path) {
-                try? fm.copyItem(atPath: newPath, toPath: archiveNew.path)
+            if !fm.fileExists(atPath: archiveNew.path) && updateURL.path != archiveNew.path {
+                try? fm.copyItem(at: updateURL, to: archiveNew)
                 NSLog("NarraFork: 新版本 v%@ 已同步归档至版本库: %@", newVer, archiveNew.path)
             }
+
+            // 部署至 App Bundle 的 narrafork-backend (若有写权限)
+            if fm.isWritableFile(atPath: resURL.path) || fm.isWritableFile(atPath: targetBackend.path) {
+                do {
+                    if fm.fileExists(atPath: targetBackend.path) {
+                        try fm.removeItem(at: targetBackend)
+                    }
+                    try fm.copyItem(at: updateURL, to: targetBackend)
+
+                    let procChmod = Process()
+                    procChmod.executableURL = URL(fileURLWithPath: "/bin/chmod")
+                    procChmod.arguments = ["+x", targetBackend.path]
+                    try? procChmod.run()
+                    procChmod.waitUntilExit()
+
+                    let procXattr = Process()
+                    procXattr.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
+                    procXattr.arguments = ["-cr", targetBackend.path]
+                    try? procXattr.run()
+                    procXattr.waitUntilExit()
+
+                    // 如果新文件来自 Resources 临时存放目录，清理冗余副本
+                    if updateURL.path.contains("/Contents/Resources/") && updateURL.path != targetBackend.path {
+                        try? fm.removeItem(at: updateURL)
+                    }
+
+                    try? fm.removeItem(at: updateJsonURL)
+                    try? fm.removeItem(at: activeJsonURL)
+                    currentActiveVersion = newVer
+                    NSLog("NarraFork: 核心成功热升级至 v%@", newVer)
+                } catch {
+                    NSLog("NarraFork: 写入更新至 targetBackend 失败: %@", error.localizedDescription)
+                }
+            } else {
+                // 如果 Bundle 无法写入，通过 active_version.json 指向 ~/.narrafork/versions/ 的新版本
+                let activeInfo: [String: Any] = [
+                    "version": newVer,
+                    "binaryPath": archiveNew.path,
+                    "switchedAt": ISO8601DateFormatter().string(from: Date())
+                ]
+                if let d = try? JSONSerialization.data(withJSONObject: activeInfo, options: [.prettyPrinted]) {
+                    try? d.write(to: activeJsonURL)
+                }
+                try? fm.removeItem(at: updateJsonURL)
+                currentActiveVersion = newVer
+                NSLog("NarraFork: 无 Bundle 写权限，已通过 active_version.json 指向版本库 v%@", newVer)
+            }
+        }
+    }
+
+    func getRunningServerInfo() -> (pid: pid_t, version: String?)? {
+        let homeDir = FileManager.default.homeDirectoryForCurrentUser
+        let lockURL = homeDir.appendingPathComponent(".narrafork/narrafork.lock")
+        if let data = try? Data(contentsOf: lockURL),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let pidInt = json["pid"] as? Int {
+            let pid = pid_t(pidInt)
+            if kill(pid, 0) == 0 {
+                var runningVer: String? = nil
+                if let argv = json["argv"] as? [String] {
+                    let joined = argv.joined(separator: " ")
+                    if let match = joined.range(of: #"[0-9]+\.[0-9]+\.[0-9]+"#, options: .regularExpression) {
+                        runningVer = String(joined[match])
+                    }
+                }
+                if runningVer == nil, let execPath = json["execPath"] as? String {
+                    if let match = execPath.range(of: #"[0-9]+\.[0-9]+\.[0-9]+"#, options: .regularExpression) {
+                        runningVer = String(execPath[match])
+                    }
+                }
+                return (pid: pid, version: runningVer)
+            }
         }
 
-        do {
-            if fm.fileExists(atPath: targetBackend.path) {
-                try fm.removeItem(at: targetBackend)
+        // 备用方案：通过 lsof 查询占用 targetPort 端口的 PID
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", "lsof -ti :\(targetPort) -sTCP:LISTEN"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        try? p.run()
+        p.waitUntilExit()
+        let d = pipe.fileHandleForReading.readDataToEndOfFile()
+        if let s = String(data: d, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let pidInt = Int(s) {
+            let pid = pid_t(pidInt)
+            return (pid: pid, version: nil)
+        }
+
+        return nil
+    }
+
+    func killRunningProcess(pid: pid_t) {
+        kill(pid, SIGTERM)
+        let deadline = Date().addingTimeInterval(1.2)
+        while kill(pid, 0) == 0 && Date() < deadline {
+            usleep(50_000)
+        }
+        if kill(pid, 0) == 0 {
+            kill(pid, SIGKILL)
+        }
+        let homeDir = FileManager.default.homeDirectoryForCurrentUser
+        let lockURL = homeDir.appendingPathComponent(".narrafork/narrafork.lock")
+        try? FileManager.default.removeItem(at: lockURL)
+        usleep(80_000)
+    }
+
+    func killAnyProcessOnPort(port: Int) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", "lsof -ti :\(port) -sTCP:LISTEN"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        try? p.run()
+        p.waitUntilExit()
+        let d = pipe.fileHandleForReading.readDataToEndOfFile()
+        if let s = String(data: d, encoding: .utf8) {
+            let pids = s.split(separator: "\n").compactMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            for p in pids {
+                kill(pid_t(p), SIGTERM)
             }
-            try fm.copyItem(at: URL(fileURLWithPath: newPath), to: targetBackend)
-
-            let procChmod = Process()
-            procChmod.executableURL = URL(fileURLWithPath: "/bin/chmod")
-            procChmod.arguments = ["+x", targetBackend.path]
-            try? procChmod.run()
-            procChmod.waitUntilExit()
-
-            let procXattr = Process()
-            procXattr.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
-            procXattr.arguments = ["-cr", targetBackend.path]
-            try? procXattr.run()
-            procXattr.waitUntilExit()
-
-            // 清理手动指定的 active_version.json，让应用默认使用新升级的 targetBackend
-            let activeJsonURL = homeDir.appendingPathComponent(".narrafork/active_version.json")
-            try? fm.removeItem(at: activeJsonURL)
-
-            // 如果下载文件留在 App Bundle Resources 中，删除残留副本以防体积膨胀
-            if newPath.contains("/Contents/Resources/") && newPath != targetBackend.path {
-                try? fm.removeItem(atPath: newPath)
+            usleep(150_000)
+            for p in pids {
+                if kill(pid_t(p), 0) == 0 {
+                    kill(pid_t(p), SIGKILL)
+                }
             }
-
-            // 清理已完成的更新标记
-            try? fm.removeItem(at: updateJsonURL)
-            NSLog("NarraFork: 热更新文件成功植入并就绪！")
-        } catch {
-            NSLog("NarraFork: 应用热更新出错: %@", error.localizedDescription)
         }
     }
 
     func checkAndStartBackend() {
         checkAndApplyPlacedUpdate()
+        resolveActiveCoreVersion()
         ensureBrowserAutoOpenDisabled()
         archiveKnownBinaries()
+
         pingServer { [weak self] isRunning in
             guard let self = self else { return }
             if isRunning {
+                // 如果端口已经在监听，检查运行的版本是否与当前目标版本一致
+                if let runningInfo = self.getRunningServerInfo() {
+                    if let runningVer = runningInfo.version, runningVer != self.currentActiveVersion {
+                        NSLog("NarraFork: 检测到端口 %d 运行着旧版本 v%@ (PID %d)，而当前设定版本为 v%@，正在重启以生效最新版本...", self.targetPort, runningVer, runningInfo.pid, self.currentActiveVersion)
+                        self.killRunningProcess(pid: runningInfo.pid)
+                        self.loadSplashScreen(status: "正在将核心升级为 v\(self.currentActiveVersion)...")
+                        self.launchBackendProcess()
+                        return
+                    }
+                }
                 self.loadApp()
             } else {
                 self.launchBackendProcess()
@@ -884,6 +1095,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     func findBackendBinary() -> URL? {
         let fm = FileManager.default
         let homeDir = fm.homeDirectoryForCurrentUser
+        let versionsDir = homeDir.appendingPathComponent(".narrafork/versions")
 
         // 0. 优先级最高：用户手动选择激活的历史版本 (~/.narrafork/active_version.json)
         let activeJsonURL = homeDir.appendingPathComponent(".narrafork/active_version.json")
@@ -894,38 +1106,82 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
             return URL(fileURLWithPath: customPath)
         }
 
-        // 1. Inside App Bundle Resources
-        if let resURL = Bundle.main.resourceURL {
-            let bundled = resURL.appendingPathComponent("narrafork-backend")
-            if fm.isExecutableFile(atPath: bundled.path) || fm.fileExists(atPath: bundled.path) {
-                return bundled
+        var candidateURL: URL? = nil
+        var candidateVer: String? = nil
+
+        // 1. 扫描 ~/.narrafork/versions/ 中的所有版本，寻找最高版本
+        if let versionFiles = try? fm.contentsOfDirectory(at: versionsDir, includingPropertiesForKeys: nil) {
+            for vf in versionFiles {
+                guard vf.lastPathComponent.hasPrefix("narrafork") &&
+                      !vf.lastPathComponent.hasSuffix(".json") &&
+                      !vf.lastPathComponent.hasSuffix(".txt") else { continue }
+                if let v = getBinaryVersion(at: vf) {
+                    if candidateVer == nil || v.compare(candidateVer!, options: .numeric) == .orderedDescending {
+                        candidateURL = vf
+                        candidateVer = v
+                    }
+                }
             }
         }
 
-        // 2. In bin/ directory alongside the App
+        // 2. 检查 App Bundle Resources/narrafork-backend
+        if let resURL = Bundle.main.resourceURL {
+            let bundled = resURL.appendingPathComponent("narrafork-backend")
+            if fm.isExecutableFile(atPath: bundled.path) || fm.fileExists(atPath: bundled.path) {
+                if let v = getBinaryVersion(at: bundled) {
+                    if candidateVer == nil || v.compare(candidateVer!, options: .numeric) == .orderedDescending {
+                        candidateURL = bundled
+                        candidateVer = v
+                    }
+                } else if candidateURL == nil {
+                    candidateURL = bundled
+                }
+            }
+        }
+
+        // 3. 伴随 bin/ 目录核心
         let appDir = Bundle.main.bundleURL.deletingLastPathComponent()
         let binDir = appDir.appendingPathComponent("bin")
         if let files = try? fm.contentsOfDirectory(at: binDir, includingPropertiesForKeys: nil) {
             let sorted = files.filter { $0.lastPathComponent.hasPrefix("narrafork") && !$0.lastPathComponent.hasSuffix(".md") }
                 .sorted { $0.lastPathComponent > $1.lastPathComponent }
-            if let first = sorted.first {
-                return first
+            for vf in sorted {
+                if let v = getBinaryVersion(at: vf) {
+                    if candidateVer == nil || v.compare(candidateVer!, options: .numeric) == .orderedDescending {
+                        candidateURL = vf
+                        candidateVer = v
+                    }
+                }
             }
         }
 
-        // 3. In same folder as the App Bundle
+        // 4. 伴随 App 所在目录
         if let files = try? fm.contentsOfDirectory(at: appDir, includingPropertiesForKeys: nil) {
             let sorted = files.filter { $0.lastPathComponent.hasPrefix("narrafork") && !$0.lastPathComponent.hasSuffix(".app") && !$0.lastPathComponent.hasSuffix(".md") }
                 .sorted { $0.lastPathComponent > $1.lastPathComponent }
-            if let first = sorted.first {
-                return first
+            for vf in sorted {
+                if let v = getBinaryVersion(at: vf) {
+                    if candidateVer == nil || v.compare(candidateVer!, options: .numeric) == .orderedDescending {
+                        candidateURL = vf
+                        candidateVer = v
+                    }
+                }
             }
         }
 
-        return nil
+        return candidateURL
     }
 
     func launchBackendProcess() {
+        if let oldProc = backendProcess {
+            oldProc.terminationHandler = nil
+            if oldProc.isRunning {
+                oldProc.terminate()
+            }
+        }
+        backendProcess = nil
+        killAnyProcessOnPort(port: targetPort)
+
         ensureBrowserAutoOpenDisabled()
 
         guard let binURL = findBackendBinary() else {
@@ -1011,6 +1267,33 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
             proc.standardError = fileHandle
         }
 
+        proc.terminationHandler = { [weak self] p in
+            guard let self = self else { return }
+            DispatchQueue.main.async {
+                NSLog("NarraFork: 后端核心进程 (PID %d) 已退出", p.processIdentifier)
+                if self.isAppTerminating { return }
+
+                // 若当前运行的核心实例已不是触发退出的 PID，说明已被显式重启逻辑替换，忽略此回调
+                if let current = self.backendProcess, current.processIdentifier != p.processIdentifier {
+                    return
+                }
+                self.backendProcess = nil
+
+                NSLog("NarraFork: 核心进程退出，外壳正在自动接管并守护重启...")
+                self.checkAndApplyPlacedUpdate()
+                self.resolveActiveCoreVersion()
+                self.clearWebViewCache { [weak self] in
+                    guard let self = self else { return }
+                    self.loadSplashScreen(status: "核心服务正在重新启动 (v\(self.currentActiveVersion))...")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                        guard let self = self else { return }
+                        self.killAnyProcessOnPort(port: self.targetPort)
+                        self.launchBackendProcess()
+                    }
+                }
+            }
+        }
+
         do {
             try proc.run()
             self.backendProcess = proc
@@ -1044,7 +1327,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     }
 
     func loadApp() {
-        self.webView.load(URLRequest(url: self.targetURL))
+        let req = URLRequest(url: self.targetURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
+        self.webView.load(req)
     }
 
     func showError(_ msg: String) {
@@ -1094,6 +1378,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelega
     }
 
     func applicationWillTerminate(_ aNotification: Notification) {
+        isAppTerminating = true
         if let token = activityToken {
             ProcessInfo.processInfo.endActivity(token)
         }
